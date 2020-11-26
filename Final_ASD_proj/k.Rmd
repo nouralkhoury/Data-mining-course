@@ -1,0 +1,539 @@
+---
+title: "ASD"
+author: "Nour Al Khoury"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::material:
+    highlight: kate
+---
+
+
+```{r setup, echo=FALSE, cache=TRUE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=FALSE,
+	             cache=TRUE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE
+               )
+opts_knit$set(width=75)
+```
+
+```{r libraries , echo=FALSE, message=F, warning=F}
+library(readxl)
+library(ggplot2)
+library(plotly)
+library(tree)
+library(randomForest)
+library(e1071)
+library(rpart)
+library(rpart.plot)
+library(visdat)
+library(kableExtra)
+library(dplyr)
+library(magrittr)
+library(RColorBrewer)
+library(plotROC)
+library(randomForestExplainer)
+```
+
+# Data preprocessing
+```{r Reading data}
+data=read_excel("./Final_proj/AutismData.xlsx",na = "?")
+dim(data)
+```
+
+```{r}
+colnames(data)
+```
+
+
+## Class Distribution
+
+```{r plotting class, echo=F, warning=F, error=F, message=F, fig.align='center', fig.pos='p'}
+(  ggplot(data, aes(`Class/ASD`, fill=`Class/ASD`))
+  + geom_bar(width = 0.4)
+)+theme_bw()
+```
+we can see that our data is not equaly distributed between classes. <br>
+
+## Data Summary()
+```{r}
+summary(data)
+```
+
+## Removing "age_cat"
+
+After skimming through the data i noticed that the age_cat seems to be homogenous. so i decided to plot in order to visualize it better <br>
+```{R warning=F, error=F, echo=F, message=F , fig.align='center',fig.pos='p'}
+
+p=data %>%  ggplot()+geom_bar(stat = "count", aes(x=age_cat,fill=`Class/ASD`), width = 0.2)+
+  theme_bw()
+p
+```
+
+```{r echo=F}
+rm(p)
+```
+
+As we can see the predictor age_cat has only 1 value. this means that it is not determining a specific class. It should be removed<br>
+```{r}
+data=data[,-which(colnames(data)=="age_cat")]
+```
+
+## Removing "result"
+IMP: result predictor is the final score obtained based on the scoring algorithm of the screening method used. This was computed in an automated manner. Hence, this predictor was used to conclude if the person has ASD or not. The threshold taken was <7 to classify as "NO" <br>
+```{r fig.align='center',fig.pos='p'}
+proof=rpart(`Class/ASD`~., data=data)
+rpart.plot(proof)
+
+# this variable will be removed from data
+data=data[,-which(colnames(data)=="result")]
+```
+
+## Converting to factors
+```{r Converting to factors}
+data=as.data.frame(data)
+for(i in 1:ncol(data)){
+  if(colnames(data)[i]!="age"){
+    data[,i]=as.factor(data[,i])
+  }
+}
+```
+
+## Outliers 
+```{r Outliers or odd values , echo=F, message=F, warning=F, fig.align='center', fig.pos='p'}
+# Most basic bubble plot
+p=data %>%
+  ggplot(aes(x=1:NROW(age), y=age, size=age, color=`Class/ASD`)) +
+    geom_point(alpha=0.5) +
+    scale_size(range = c(0.5, 6))+
+  xlab("row")+ labs(title = "Age value distribution") 
+
+ggplotly(p)
+```
+<br> we can see that there is only one abnormal value at row 53.<br>
+
+```{r echo=F}
+rm(p)
+```
+
+
+I decided to replace this outlier with NA and replace it later with the mean of the class it belongs to.<br>
+```{r}
+data$age[53]=NA
+```
+
+
+## NA values 
+
+```{r fig.align='center', fig.pos='p'}
+vis_dat(data)
+```
+
+For the ethnicity and relation, since they are categorical, it doesn't make sense to arbitrary assign a category to a missing value. So, they will be classified as missing.
+As for the age, will be replaced by the mean of the class.<br>
+```{r warning=F, error=F, message=F}
+#age
+ageNA=which(is.na(data$age))
+for(i in ageNA){
+  ## check to which class it belongs
+  class=data$`Class/ASD`[i]
+  #get the average age for this class
+  classAV= round(mean(data$age[which(data$`Class/ASD`==class)], na.rm = T))
+  
+  data$age[i]=classAV
+}
+
+data$ethnicity=as.character(data$ethnicity)
+data$relation=as.character(data$relation)
+
+ethnicityNA= which(is.na(data$ethnicity))
+relationNA= which(is.na(data$relation))
+data$ethnicity[ethnicityNA]="Missing"
+data$relation[relationNA]="Missing"
+
+data$ethnicity=as.factor(data$ethnicity)
+data$relation=as.factor(data$relation)
+```
+
+```{r echo=F}
+rm(ageNA, ethnicityNA, relationNA, classAV, class, i)
+```
+
+
+```{r fig.align='center', fig.pos='p'}
+(ggplot(data, aes(data$ethnicity, fill=`Class/ASD`))
+  + geom_bar(width = 0.35)
+)+theme_bw()
+
+data$ethnicity[which(data$ethnicity=="others")]="Others"
+data$ethnicity=droplevels(data$ethnicity)
+```
+As we notice, there have been 2 seperate levels for the same category. So they should be grouped under one level.<br>
+
+## Removing "used_app_before"
+```{r}
+# the used_app_before does not really help to classify the output. It better to remove it.
+table(data$`Class/ASD`, data$used_app_before)
+data=data[,-which(colnames(data)=="used_app_before")]
+```
+
+```{r}
+dim(data)
+```
+
+
+
+# Bagging 
+
+Since we have to do bagging for different set of predictors: <br>
+I started with the full model, then started removing manually the variable that has the lowest mean decrease in Gini (The mean decrease in Gini is is the average of a variable's total decrease in node impurity)<br>
+
+```{r}
+r16=randomForest(`Class/ASD`~.-country_of_residence , data=data, importance=T, mtry=16)
+```
+
+
+```{r}
+r15=randomForest(`Class/ASD`~. -country_of_residence -gender, data=data, importance=T, mtry=15)
+```
+
+```{r}
+r14=randomForest(`Class/ASD`~.  -country_of_residence -gender -jundice, data=data, importance=T, mtry=14)
+```
+
+```{r}
+r13=randomForest(`Class/ASD`~.  -country_of_residence -gender -austim -jundice, data=data, importance=T, mtry=13)
+```
+
+```{r}
+r12=randomForest(`Class/ASD`~. -country_of_residence -gender -austim -relation -jundice,data=data, importance=T, mtry=12)
+```
+
+```{r}
+r11=randomForest(`Class/ASD`~.  -country_of_residence -gender -austim -relation -jundice -A2_Score,data=data, importance=T, mtry=11)
+```
+This continues till.. number of predictors=1 <br> 
+```{r echo=F}
+r10=randomForest(`Class/ASD`~.  -country_of_residence -gender -austim -relation -jundice -A2_Score -A10_Score,data=data, importance=T, mtry=10)
+
+r9=randomForest(`Class/ASD`~.-country_of_residence -gender -austim -relation -jundice -A2_Score -A10_Score -A8_Score,data=data, importance=T, mtry=9)
+
+r8=randomForest(`Class/ASD`~.  -country_of_residence -gender -austim -relation -jundice -A2_Score -A10_Score -A8_Score -A3_Score,data=data, importance=T, mtry=8)
+
+r7=randomForest(`Class/ASD`~.  -country_of_residence -gender -austim -relation -jundice -A2_Score -A10_Score -A8_Score -A3_Score -A7_Score,data=data, importance=T, mtry=7)
+
+
+r6=randomForest(`Class/ASD`~.  -country_of_residence -gender -austim -relation -jundice -A2_Score -A10_Score -A8_Score -A3_Score -A7_Score -A1_Score,data=data, importance=T, mtry=6)
+
+r5=randomForest(`Class/ASD`~.  -country_of_residence -gender -austim -relation -jundice -A2_Score -A10_Score -A8_Score -A3_Score -A7_Score -A1_Score -A4_Score,data=data, importance=T, mtry=5)
+
+r4=randomForest(`Class/ASD`~.  -country_of_residence -gender -austim -relation -jundice -A2_Score -A10_Score -A8_Score -A3_Score -A7_Score -A1_Score -A4_Score -A5_Score,data=data, importance=T, mtry=4)
+
+r3=randomForest(`Class/ASD`~.  -country_of_residence -gender -austim -relation -jundice -A2_Score -A10_Score -A8_Score -A3_Score -A7_Score -A1_Score -A4_Score -A5_Score -A6_Score,data=data, importance=T, mtry=3)
+
+r2=randomForest(`Class/ASD`~.  -country_of_residence -gender -austim -relation -jundice -A2_Score -A10_Score -A8_Score -A3_Score -A7_Score -A1_Score -A4_Score -A5_Score -A6_Score -ethnicity,data=data, importance=T, mtry=2)
+```
+
+```{r}
+r1=randomForest(`Class/ASD`~. -country_of_residence -gender -austim -relation -jundice -A2_Score -A10_Score -A8_Score -A3_Score -A7_Score -A1_Score -A4_Score -A5_Score -A6_Score -ethnicity -age,data=data, importance=T, mtry=1)
+```
+
+
+## Order of variable removal
+```{r fig.align='center', fig.pos='p', echo=F, cache=T}
+variables=c("gender", "jundice", "austim", "relation", "A2_Score", "A10_Score", "A8_Score", "A3_score", "A7_Score", "A1_Score", "A4_score", "A5_Score", "A6_Score", "ethnicity","Age")
+
+variables=cbind(1:length(variables),variables)
+variables=as.data.frame(variables)
+variables[,1:2] %>%
+  mutate_if(is.numeric, function(x) {
+    cell_spec(x, bold = T, 
+              color = spec_color(x, end = 0.7),
+              font_size = spec_font_size(x))
+  }) %>%
+  mutate( variables= cell_spec(
+    variables, color = "white", bold = T,
+    background = spec_color(1:15, end = 0.9, option = "A", direction = -1)
+  )) %>%
+  kable(escape = F, align = "c", caption = "Direction: 1= first removed \n 15= last removed") %>%
+  kable_styling(c("condensed", "hover"), full_width = F)
+```
+
+
+## Bootstrap for the different bagging size 
+```{r Bootsrap on 16 models , cache=T}
+set.seed(1)
+
+tempn.data <- cbind(data, 1:nrow(data))
+colnames(tempn.data)[ncol(tempn.data)] <- "original"
+
+bags.acc=matrix(ncol=16, nrow = 100)
+
+# this list holds the models with different size and different predictors 
+models=list(r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12,r13,r14,r15,r16)
+
+# running bootstrap to get the accuracy of each model with different sizes 
+for( i in 1:100){
+  
+validation= sample(1:nrow(tempn.data),nrow(tempn.data)*0.3, replace = F)
+remain <- tempn.data[-validation, ]
+  
+  train <- remain
+  toadd= sample(1:nrow(remain), nrow(tempn.data)*0.3, T)
+  train=rbind(train, remain[toadd,])
+  train=train[,-which(colnames(train)=="original")]
+  
+  for(j in 1:length(models)){
+ 
+r=randomForest(as.formula(models[[j]][["call"]][["formula"]]), data=train, importance=T, mtry=models[[j]][["mtry"]])
+
+bags.pred=predict(r, tempn.data[validation,], type="class")
+bags.acc[i,j]=mean(bags.pred == tempn.data$`Class/ASD`[validation])
+
+}
+}
+
+which.max(apply(bags.acc, 2, mean))
+```
+
+```{r fig.align='center', fig.pos='p'}
+accuracy=(apply(bags.acc, 2, mean))
+size=1:16
+acc_size=cbind(size, accuracy)
+acc_size=as.data.frame(acc_size)
+
+p <- ggplot(data=acc_size, aes(x=size, y=accuracy))+
+     geom_line()+geom_point(aes(col=accuracy))
+ggplotly(p)
+```
+
+```{r echo=F}
+rm(accuracy,size, acc_size,p,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r13,r14,r15,r16)
+```
+
+
+# Random forest
+
+NOTE: the bootstrap for this model will be done at the end with all the other models. <br>
+```{r Random forest , cache=T}
+set.seed(1)
+train=sample(1:nrow(data),nrow(data)*0.7, replace = F)
+
+forest=randomForest(`Class/ASD`~. -country_of_residence, data=data[train,], importance=T, mtry=sqrt(ncol(data)-2))
+```
+
+measure training and test accuracy
+```{r}
+ mean(predict(forest, tempn.data[-train,], type="class") == data$`Class/ASD`[-train])
+```
+
+```{r fig.align='center', fig.pos='p'}
+plot(forest)
+```
+
+
+```{r fig.align='center', fig.pos='p'}
+min_depth=min_depth_distribution(forest)
+plot_min_depth_distribution(min_depth, mean_sample = "relevant_trees", k=15)
+```
+the minimum depth means what is the first time this variable is used to split the tree. Therefore, more important variables have lower min depth values. <br>
+For example here A9_Score is the most important and jundice is the least important. Again, this is based of the min depth measurement<br>
+
+```{r warning=F, message=F, error=F , fig.align='center', fig.pos='p'}
+imp=measure_importance(forest)
+plot_multi_way_importance(imp, x_measure = "accuracy_decrease", y_measure = "gini_decrease",size_measure ="no_of_nodes" )
+```
+
+```{r echo=F}
+rm(forest, imp)
+```
+
+# SVM Linear Kernel
+
+NOTE: the bootstrap will be done in the end. <br>
+
+```{r }
+set.seed(1)
+validation= sample(1:nrow(tempn.data),nrow(tempn.data)*0.3, replace = F)
+remain <- tempn.data[-validation, ]
+
+grid= 10^seq(-2, 3, length=200)
+
+# tuning to get the best cost 
+tunesvm=tune(svm, `Class/ASD`~. -original,data=remain, ranges = list(cost=grid), kernel="linear")
+
+# this is the best model we got from tuning 
+bestmod= tunesvm$best.model
+```
+
+measure training and test accuracy
+```{r}
+ mean(predict(bestmod, tempn.data[validation,])== tempn.data$`Class/ASD`[validation] )
+```
+
+
+# SVM Radial kernel
+
+NOTE: the bootstrap will be done in the end. <br>
+```{r }
+set.seed(1)
+
+# tuning to get the best cost and gamma
+svmradial= tune(svm, `Class/ASD`~.  -original, data=remain, kernel="radial", ranges=list(cost=grid), gamma=grid)
+
+radial.op= svmradial$best.model
+```
+
+```{R}
+mean(predict(radial.op, tempn.data[validation,]) == tempn.data$`Class/ASD`[validation])
+```
+
+# SVM Polynomial Kernel
+
+NOTE: the bootstrap will be done in the end. <br>
+
+```{r warning=F, message=F, error=F}
+set.seed(1)
+
+# tuning to get the best cost and gamma
+svmpoly3= tune(svm, `Class/ASD`~.  -original, data=remain, kernel="polynomial", ranges=list(cost=grid), gamma=grid, degree=3)
+
+svmpoly2= tune(svm, `Class/ASD`~.  -original, data=remain, kernel="polynomial", ranges=list(cost=grid), gamma=grid, degree=2)
+
+poly2.op= svmpoly2$best.model
+poly3.op= svmpoly3$best.model
+```
+
+
+```{r}
+ mean(predict(poly3.op,tempn.data[validation,]) == tempn.data$`Class/ASD`[validation])
+ mean(predict(poly2.op,tempn.data[validation,]) == tempn.data$`Class/ASD`[validation])
+```
+
+
+
+# Final Bootstrap for all models
+```{r}
+radial.acc=c()
+linear.acc=c()
+poly2.acc=c()
+poly3.acc=c()
+forests.acc=c()
+bag12.acc=c()
+
+radial.train=c()
+linear.train=c()
+poly2.train=c()
+poly3.train=c()
+forests.train=c()
+bag12.train=c()
+
+for( i in 1:100){
+validation= sample(1:nrow(tempn.data),nrow(tempn.data)*0.3, replace = F)
+remain <- tempn.data[-validation, ]
+  
+train <- remain
+toadd= sample(1:nrow(remain), nrow(tempn.data)*0.3, T)
+train=rbind(train, remain[toadd,])
+  
+lop=svm(`Class/ASD`~. -original, data=train, kernel="linear", cost=bestmod$cost)
+linear.pred=predict(lop, tempn.data[validation,], type="class")
+linear.acc=c(linear.acc,mean(linear.pred == tempn.data$`Class/ASD`[validation]))
+linear.train=c(linear.train, mean(predict(lop, train, type="class") == train$`Class/ASD`))
+
+rop=svm(`Class/ASD`~. -original, data=train, kernel="radial", cost=radial.op$cost,gamma=radial.op$gamma)
+radial.pred=predict(rop, tempn.data[validation,], type="class")
+radial.acc=c(radial.acc,mean(radial.pred == tempn.data$`Class/ASD`[validation]))
+radial.train=c(radial.train, mean(predict(rop, train, type="class") == train$`Class/ASD`))
+
+poly2=svm(`Class/ASD`~. -original, data=train, kernel="polynomial", cost=poly2.op$cost, gamma=poly2.op$gamma)
+poly2.pred=predict(poly2, tempn.data[validation,], type="class")
+poly2.acc=c(poly2.acc,mean(poly2.pred == tempn.data$`Class/ASD`[validation]))
+poly2.train=c(poly2.train, mean(predict(poly2, train, type="class") == train$`Class/ASD`))
+
+poly3=svm(`Class/ASD`~. -original, data=train, kernel="polynomial", cost=poly3.op$cost, gamma=poly3.op$gamma)
+poly3.pred=predict(poly3, tempn.data[validation,], type="class")
+poly3.acc=c(poly3.acc,mean(poly3.pred == tempn.data$`Class/ASD`[validation]))
+poly3.train=c(poly3.train, mean(predict(poly3, train, type="class") == train$`Class/ASD`))
+
+
+forests=randomForest(`Class/ASD`~.-country_of_residence -original , data=train, importance=T, mtry=sqrt(ncol(data)-2))
+ forests.pred=predict(forests, tempn.data[validation,], type="class")
+forests.acc=c(forests.acc,mean(forests.pred == tempn.data$`Class/ASD`[validation]))
+forests.train=c(forests.train, mean(predict(forests, train, type="class") == train$`Class/ASD`))
+
+ bag12=randomForest(`Class/ASD` ~ . - country_of_residence -gender - austim - relation - jundice, data = train, importance = T,mtry = 12) 
+ bag12.pred=predict(bag12, tempn.data[validation,], type="class")
+bag12.acc=c(bag12.acc,mean(bag12.pred == tempn.data$`Class/ASD`[validation]))
+bag12.train=c(bag12.train, mean(predict(bag12, train, type="class") == train$`Class/ASD`))
+}
+
+```
+
+# Train/Test accuracy
+```{r}
+trains= as.data.frame(c(mean(forests.train), mean(linear.train), mean(radial.train), mean(poly2.train),mean(poly3.train),mean(bag12.train)))
+
+tests= as.data.frame(c(mean(forests.acc), mean(linear.acc), mean(radial.acc),mean(poly2.acc), mean(poly3.acc), mean(bag12.acc) ) )
+df=as.data.frame(c(trains, tests))
+df=cbind(df,c(1:6))
+colnames(df)= c("trains", "tests", "models")
+p= ggplot(data=df , aes(x=models, y=trains))+geom_line(aes(color="train"))+ geom_line(aes(x=models, y=tests, color="test"))+ geom_point() + scale_y_continuous(name="Hola", limits=c(.5, 1))+geom_text(aes(label =c("forest", "linear", "radial","poly2", "poly3", "bag12")),color="white",
+              size =5)+theme(legend.position = "bottom")
+ggplotly(p)
+```
+
+
+# ROC curves
+
+```{r error=F, fig.align='center', fig.pos='p', message=FALSE, warning=FALSE}
+D=cbind(forests.pred,linear.pred,radial.pred,bag12.pred,poly2.pred,poly3.pred,tempn.data$`Class/ASD`[validation])
+D=as.data.frame(D)
+colnames(D)=c("forests.pred","linear.pred", "radial.pred","bag12.pred","poly2.pred", "poly3.pred", "V5")
+basicplot <- ggplot(D)+ 
+  geom_roc( aes(d =forests.pred, m = V5,color= "forest"), labels = F, linejoin="round", lineend = "round",n.cuts = 0)+ 
+  geom_roc( aes(d =linear.pred, m = V5, color= "linear"), labels = F, n.cuts = 3)+
+  geom_roc( aes(d =poly2.pred, m = V5, color= "poly2"), labels = F, n.cuts = 3)+
+   geom_roc( aes(d =poly3.pred, m = V5, color= "poly3"), labels = F, n.cuts = 0)+
+  geom_roc( aes(d =radial.pred, m = V5, color="radial"), labels = F, n.cuts = 0)+
+  geom_roc( aes(d =bag12.pred, m = V5, color= "bag12"), labels = F, n.cuts = 0)+style_roc()
+  
+basicplot
+```
+
+
+#  Results
+
+```{r fig.align='center', fig.pos='p', echo=F, warning=F, error=F, message=F}
+results=data.frame(NA)
+results=cbind(results, c(round(mean(radial.acc),4), round(mean(linear.acc),4), round(mean(poly2.acc),4),round(mean(poly3.acc),4) ,round(mean(forests.acc),4),
+round(mean(bag12.acc),4)))
+results=cbind(results, c("Radial_svm", "linear_svm","poly2_svm","poly3_svm","randomforest", "bag12"))
+colnames(results)=c("1","accuracy", "model")
+results[,2:3] %>%
+  mutate_if(is.numeric, function(x) {
+    cell_spec(x, bold = T, 
+              color = spec_color(x, end = 0.9),
+              font_size = spec_font_size(x))
+  }) %>%
+  mutate(model = cell_spec(
+    model, color = "white", bold = T,
+    background = spec_color(1:6, end = 0.9, option = "B", direction = -1)
+  )) %>%
+  kable(escape = F, align = "c") %>%
+  kable_styling(c("striped", "condensed", "hover"), full_width = F)
+```
+
+As we can see, all the models perform incredibly well. Howver, the linear support vector machine model was yet the best with a 99% accuracy. Impressively, the best SVM model (linear) outperformed the random forest model by 4%. Also, we should note that the random forest performed better than the bagging model (by 3%). <br>
+
+
+
+
